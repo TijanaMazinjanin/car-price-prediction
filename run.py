@@ -1,145 +1,148 @@
 import pandas as pd
 import numpy as np
-from scipy import stats
-import matplotlib.pyplot as plt
+import sys
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestRegressor
-import seaborn as sns
-
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVR
 from sklearn.metrics import mean_squared_error
 
-FILE_NAME="train.tsv"
 
-def evaluate_model(model, X_test, y_test, model_name="Model"):
-    y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
+TARGET_COL = 'Cena'
+YEAR_COL = 'Godina proizvodnje'
+ENGINE_VOLUME_COL = 'Zapremina motora'
+MILEAGE_COL = 'Kilometraza'
+HP_COL = 'Konjske snage'
+TOWN_COL = 'Grad'
+BRAND_COL = 'Marka'
+TYPE_COL = 'Karoserija'
+FUEL_COL = 'Gorivo' 
+GEARBOX_COL = 'Menjac' 
+
+def load_data(file_path):
+    
+    try:
+        df = pd.read_csv(file_path, sep='\t')
+        return df
+    except FileNotFoundError:
+        sys.exit(1)
+
+def preprocess_data(df, training=True, town_encoding_map=None, global_mean=None, price_scaler=None):
+   
+    df_processed = df.copy()
+    
+    
+    for col in df_processed.select_dtypes(include=np.number).columns.tolist():
+        if df_processed[col].isnull().any():
+            median_val = df_processed[col].median()
+            df_processed[col].fillna(median_val, inplace=True)
+
+    for col in df_processed.select_dtypes(include='object').columns.tolist():
+        if df_processed[col].isnull().any():
+            mode_val = df_processed[col].mode()[0]
+            df_processed[col].fillna(mode_val, inplace=True)
+
+
+    current_year = 2025
+    df_processed['Car_Age'] = current_year - df_processed[YEAR_COL]
+    df_processed['Car_Age'] = np.clip(df_processed['Car_Age'], 0, 20)
+    df_processed['HP_per_EngineVolume'] = df_processed[HP_COL] / (df_processed[ENGINE_VOLUME_COL] + 1e-6)
+    df_processed['Mileage_per_Age'] = df_processed[MILEAGE_COL] / (df_processed['Car_Age'] + 1e-6)
+
+    cols_to_cap = [ENGINE_VOLUME_COL, MILEAGE_COL, HP_COL]
+    if training:
+        cols_to_cap.append(TARGET_COL)
+
+    for col in cols_to_cap:
+        if col in df_processed.columns:
+            Q1 = df_processed[col].quantile(0.25)
+            Q3 = df_processed[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = max(0, Q1 - 1.5 * IQR)
+            upper_bound = Q3 + 1.5 * IQR
+            df_processed[col] = np.clip(df_processed[col], lower_bound, upper_bound)
+    
+    df_processed[MILEAGE_COL] = np.clip(df_processed[MILEAGE_COL], a_min=df_processed[MILEAGE_COL].min(), a_max=700000)
+    
+    if training:
+        price_scaler = StandardScaler()
+        df_processed[TARGET_COL] = price_scaler.fit_transform(df_processed[[TARGET_COL]])
+    else:
+        df_processed[TARGET_COL] = price_scaler.transform(df_processed[[TARGET_COL]])
+
+    if training:
+        y_train_temp = df_processed[TARGET_COL]
+        town_encoding_map = y_train_temp.groupby(df_processed[TOWN_COL]).mean()
+        global_mean = y_train_temp.mean()
+        df_processed[TOWN_COL] = df_processed[TOWN_COL].map(town_encoding_map).fillna(global_mean)
+    else:
+        df_processed[TOWN_COL] = df_processed[TOWN_COL].map(town_encoding_map).fillna(global_mean)
+
+    
+    df_processed.drop([YEAR_COL, ENGINE_VOLUME_COL], axis=1, inplace=True)
+    
+   
+    X = df_processed.drop(TARGET_COL, axis=1)
+    y = df_processed[TARGET_COL]
+
+    if training:
+        return X, y, price_scaler, town_encoding_map, global_mean
+    else:
+        return X, y
+
+def train(X_train, y_train):
+    numerical_features = X_train.select_dtypes(include=np.number).columns.tolist()
+    categorical_features_for_onehot = [col for col in X_train.select_dtypes(include='object').columns.tolist() if col != TOWN_COL]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', StandardScaler(), numerical_features),
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features_for_onehot)
+        ],
+        remainder='passthrough'
+    )
+
+    pipeline = Pipeline(steps=[('preprocessor', preprocessor),
+                               ('regressor', SVR(kernel='rbf'))])
+
+    param_grid = {
+        'regressor__C': [0.1, 1, 10, 100],
+        'regressor__epsilon': [0.01, 0.1, 0.5, 1.0]
+    }
+
+    grid_search = GridSearchCV(pipeline, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1, verbose=0)
+    grid_search.fit(X_train, y_train)
+    
+    return grid_search.best_estimator_
+
+def evaluate_model(model, X_test, y_test, price_scaler):
+    y_pred_scaled = model.predict(X_test)
+    
+    y_pred = price_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    y_actual = price_scaler.inverse_transform(y_test.values.reshape(-1, 1)).flatten()
+
+    mse = mean_squared_error(y_actual, y_pred)
     rmse = np.sqrt(mse)
 
-    print(f"\n--- {model_name} Performance ---")
-    print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+    print(rmse)
 
-    return rmse
+if __name__ == '__main__':
+    if len(sys.argv) != 3:
+        sys.exit(1)
 
-def draw_correlation_matrix(df_processed):
+    train_file_path = sys.argv[1]
+    test_file_path = sys.argv[2]
 
-    numerical_df = df_processed.select_dtypes(include=np.number)
+    df_train = load_data(train_file_path)
+    df_test = load_data(test_file_path)
 
-    correlation_matrix = numerical_df.corr()
-
-    plt.figure(figsize=(10, 8))
-
-    sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5)
-
-    plt.title('Correlation Matrix of Numerical Features and Price', fontsize=16)
-
-    plt.show()
-
-    print("\nCorrelation matrix values:")
-    print(correlation_matrix)
-
-def draw(df):
-    pass
-
-try:
-    df = pd.read_csv(FILE_NAME, sep='\t')
-    print(f"Shape of the dataset: {df.shape}")
-    print(df.head())
-
-    # data processing
-
-    df_processed = df.copy()
-
-    # numerical_cols = ['Cena', 'Godina proizvodnje', 'Zapremina motora', 'Kilometraza', 'Konjske snage']
-    # categorical_cols = ['Marka', 'Grad', 'Karoserija', 'Gorivo', 'Menjac']
-    categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
-    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
-
-    try:
-        for col in numerical_cols:
-            if df_processed[col].isnull().any():
-                df_processed[col].fillna(df_processed[col].median(), inplace=True)
-
-        for col in categorical_cols:
-            if df_processed[col].isnull().any():
-                #value that appears most often
-                df_processed[col].fillna(df_processed[col].mode()[0], inplace=True)
-        
-        current_year = 2025
-        df_processed['Age'] = current_year - df_processed['Godina proizvodnje']
-        df_processed.drop('Godina proizvodnje', axis=1, inplace=True)
-        numerical_cols.remove('Godina proizvodnje')
-        numerical_cols.append('Age')
-
-
-        num_unique_brands = df_processed['Grad'].nunique()
-        print(num_unique_brands)
-
-        encoder = OneHotEncoder(sparse_output=False)
-
-        encoded = encoder.fit_transform(df_processed[categorical_cols])
-
-        one_hot_df = pd.DataFrame(encoded, columns=encoder.get_feature_names_out(categorical_cols))
-
-        df_encoded = pd.concat([df, one_hot_df], axis=1)
-
-        df_encoded = df_encoded.drop(categorical_cols, axis=1)
-
-        print(df_encoded.head())
-
-        X = df_processed.drop('Cena', axis=1)
-        y = df_processed['Cena']
-
-        numerical_features = X.select_dtypes(include=np.number).columns.tolist()
-        categorical_features = X.select_dtypes(include='object').columns.tolist()
-
-        numerical_transformer = StandardScaler()
-        categorical_transformer = OneHotEncoder(handle_unknown='ignore')
+    X_train, y_train, price_scaler, town_encoding_map, global_mean = preprocess_data(df_train, training=True)
+    X_test, y_test = preprocess_data(df_test, training=False, 
+                                     town_encoding_map=town_encoding_map, 
+                                     global_mean=global_mean, 
+                                     price_scaler=price_scaler)
     
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('numerical', numerical_transformer, numerical_features),
-                ('categorical', categorical_transformer, categorical_features)
-            ])
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = train(X_train, y_train)
 
-        print(f"\nShape of X_train: {X_train.shape}")
-        print(f"Shape of X_test: {X_test.shape}")
-        print(f"Shape of y_train: {y_train.shape}")
-        print(f"Shape of y_test: {y_test.shape}")
-
-        X_train_processed = preprocessor.fit_transform(X_train)
-        X_test_processed = preprocessor.transform(X_test)
-
-        linear_model = LinearRegression()
-        linear_model.fit(X_train_processed, y_train)
-        linear_metrics = evaluate_model(linear_model, X_test_processed, y_test, "Linear Regression")
-
-        print("\n--- Training Ridge Regression ---")
-        ridge_model = Ridge(alpha=1.0) # You can tune alpha
-        ridge_model.fit(X_train_processed, y_train)
-        ridge_metrics = evaluate_model(ridge_model, X_test_processed, y_test, "Ridge Regression")
-
-        print("\n--- Training Lasso Regression ---")
-        lasso_model = Lasso(alpha=0.1) # You can tune alpha
-        lasso_model.fit(X_train_processed, y_train)
-        lasso_metrics = evaluate_model(lasso_model, X_test_processed, y_test, "Lasso Regression")
-
-
-        print("\n--- Training Random Forest Regressor ---")
-        # RandomForest generally performs well. Consider tuning n_estimators and max_depth.
-        rf_model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        rf_model.fit(X_train_processed, y_train)
-        rf_metrics = evaluate_model(rf_model, X_test_processed, y_test, "Random Forest Regressor")
-
-
-
-
-    except Exception as e:
-        print(e)
-
-except:
-    print("Error: train.tsv not found. Please make sure the file is in the correct directory.")
+    evaluate_model(model, X_test, y_test, price_scaler)
